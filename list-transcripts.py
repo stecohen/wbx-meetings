@@ -21,9 +21,52 @@ TRANSCRIPTS_ENDPOINT = f"{API_BASE}/meetingTranscripts"
 AUTHORIZE_ENDPOINT = f"{API_BASE}/authorize"
 TOKEN_ENDPOINT = f"{API_BASE}/access_token"
 TOKEN_CACHE_PATH = Path.home() / ".wbx_meeting_transcripts_token.json"
+SEEN_MEETINGS_CACHE_PATH = Path.home() / ".wbx_meeting_transcripts_seen_meetings.json"
+PROJECT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 _ACCESS_TOKEN_CACHE = None
+_ACCESS_TOKEN_SOURCE = None
+
+
+def load_env_file(path=PROJECT_ENV_PATH, override=False):
+    """Load KEY=VALUE pairs from .env into process environment."""
+    warnings = []
+    if not path.exists():
+        return False, warnings
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for index, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    warnings.append(
+                        f"Warning: Ignoring malformed .env line {index} in {path}: {raw_line.strip()}"
+                    )
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    warnings.append(
+                        f"Warning: Ignoring .env line {index} with empty key in {path}"
+                    )
+                    continue
+
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+
+                if not override and key in os.environ:
+                    continue
+                os.environ[key] = value
+    except OSError as e:
+        warnings.append(f"Warning: Could not read {path}: {e}")
+        return False, warnings
+
+    return True, warnings
 
 
 def debug_log(enabled, message):
@@ -54,6 +97,87 @@ def load_cached_oauth_token():
     except (OSError, json.JSONDecodeError):
         return None
     return None
+
+
+def load_seen_meeting_ids():
+    """Load set of previously seen meeting IDs from disk."""
+    if not SEEN_MEETINGS_CACHE_PATH.exists():
+        return set()
+    try:
+        with open(SEEN_MEETINGS_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    ids = data.get("meeting_ids", [])
+    if not isinstance(ids, list):
+        return set()
+    return {item for item in ids if isinstance(item, str) and item}
+
+
+def save_seen_meeting_ids(meeting_ids):
+    """Persist seen meeting IDs to disk."""
+    payload = {
+        "meeting_ids": sorted(meeting_ids),
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    with open(SEEN_MEETINGS_CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.chmod(SEEN_MEETINGS_CACHE_PATH, 0o600)
+
+
+def clear_auth_state():
+    """Clear in-process token env vars and remove OAuth token cache file."""
+    auth_env_keys = ["WEBEX_ACCESS_TOKEN"]
+    cleared_keys = []
+    for key in auth_env_keys:
+        if key in os.environ:
+            os.environ.pop(key, None)
+            cleared_keys.append(key)
+
+    cache_deleted = False
+    cache_error = None
+    if TOKEN_CACHE_PATH.exists():
+        try:
+            TOKEN_CACHE_PATH.unlink()
+            cache_deleted = True
+        except OSError as e:
+            cache_error = str(e)
+
+    return cleared_keys, cache_deleted, cache_error
+
+
+def clear_auth_from_env_file(path=PROJECT_ENV_PATH):
+    """Blank token keys in .env so they do not auto-load on next run."""
+    auth_env_keys = {"WEBEX_ACCESS_TOKEN"}
+    if not path.exists():
+        return False, 0, None
+
+    try:
+        changed = 0
+        new_lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                stripped = raw_line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in raw_line:
+                    new_lines.append(raw_line)
+                    continue
+
+                key, _ = raw_line.split("=", 1)
+                key = key.strip()
+                if key in auth_env_keys:
+                    new_lines.append(f'{key}=""\n')
+                    changed += 1
+                else:
+                    new_lines.append(raw_line)
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except OSError as e:
+        return True, 0, str(e)
+
+    return True, changed, None
 
 
 def save_cached_oauth_token(token_data):
@@ -194,9 +318,14 @@ def oauth_access_token(debug=False):
 
     if not client_id or not client_secret:
         print(
+            "Warning: Missing OAuth configuration.",
+            file=sys.stderr,
+        )
+        print(
             "Error: WEBEX_ACCESS_TOKEN is not set, and OAuth is not configured.\n"
             "Set WEBEX_CLIENT_ID and WEBEX_CLIENT_SECRET (and optionally WEBEX_REDIRECT_URI/"
-            "WEBEX_REDIRECT_PORT/WEBEX_OAUTH_SCOPES).",
+            "WEBEX_REDIRECT_PORT/WEBEX_OAUTH_SCOPES).\n"
+            "Tip: copy .env.example to .env and fill in values.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -235,19 +364,22 @@ def oauth_access_token(debug=False):
 
 def get_access_token(debug=False):
     """Get access token from env var or OAuth."""
-    global _ACCESS_TOKEN_CACHE
+    global _ACCESS_TOKEN_CACHE, _ACCESS_TOKEN_SOURCE
     if _ACCESS_TOKEN_CACHE:
         debug_log(debug, "using in-memory access token cache")
+        _ACCESS_TOKEN_SOURCE = "in_memory"
         return _ACCESS_TOKEN_CACHE
 
     token = os.environ.get("WEBEX_ACCESS_TOKEN")
     if token:
         debug_log(debug, "using WEBEX_ACCESS_TOKEN from environment")
         _ACCESS_TOKEN_CACHE = token
+        _ACCESS_TOKEN_SOURCE = "env"
         return token
 
     debug_log(debug, "WEBEX_ACCESS_TOKEN not set; using OAuth flow")
     _ACCESS_TOKEN_CACHE = oauth_access_token(debug=debug)
+    _ACCESS_TOKEN_SOURCE = "oauth"
     return _ACCESS_TOKEN_CACHE
 
 
@@ -406,6 +538,10 @@ def get_transcript(meeting_id, debug=False):
         return None
 
 def main():
+    _, env_warnings = load_env_file()
+    for warning in env_warnings:
+        print(warning, file=sys.stderr)
+
     parser = argparse.ArgumentParser(
         prog="wbx-meeting-transcripts",
         description="List and extract Webex meeting transcripts."
@@ -447,6 +583,11 @@ def main():
         help="Case-insensitive title filter for listing meetings (e.g., --filter matt)."
     )
     parser.add_argument(
+        "--new-meetings",
+        action="store_true",
+        help="List only meetings not seen in earlier runs (tracked by local meeting ID cache)."
+    )
+    parser.add_argument(
         "--output",
         help="Output file path for --meeting-id (defaults to <meeting_title>.txt)."
     )
@@ -465,6 +606,11 @@ def main():
         action="store_true",
         help="Authenticate via OAuth (or refresh cached OAuth token) and exit."
     )
+    parser.add_argument(
+        "--clear-auth",
+        action="store_true",
+        help="Clear token auth (WEBEX_ACCESS_TOKEN and local OAuth token cache), then exit."
+    )
     
     args = parser.parse_args()
 
@@ -479,10 +625,45 @@ def main():
         print("Error: --days must be greater than 0.", file=sys.stderr)
         sys.exit(1)
 
+    if args.clear_auth:
+        cleared_keys, cache_deleted, cache_error = clear_auth_state()
+        env_file_exists, env_file_changes, env_file_error = clear_auth_from_env_file()
+        if cleared_keys:
+            print(f"Cleared in-process auth vars: {', '.join(cleared_keys)}")
+        else:
+            print("No in-process Webex auth vars were set.")
+
+        if cache_deleted:
+            print(f"Deleted OAuth token cache: {TOKEN_CACHE_PATH}")
+        elif cache_error:
+            print(f"Warning: Could not delete token cache {TOKEN_CACHE_PATH}: {cache_error}", file=sys.stderr)
+        else:
+            print(f"No OAuth token cache found at: {TOKEN_CACHE_PATH}")
+
+        if env_file_exists and env_file_changes > 0:
+            print(f'Cleared {env_file_changes} auth entries in: {PROJECT_ENV_PATH}')
+        elif env_file_error:
+            print(f"Warning: Could not update {PROJECT_ENV_PATH}: {env_file_error}", file=sys.stderr)
+        elif env_file_exists:
+            print(f"No auth entries found to clear in: {PROJECT_ENV_PATH}")
+        else:
+            print(f"No .env file found at: {PROJECT_ENV_PATH}")
+
+        print(
+            "Note: to clear variables from your current shell session, run:\n"
+            "unset WEBEX_ACCESS_TOKEN"
+        )
+        return
+
     if args.login:
         # Triggers OAuth/browser flow or refresh path, then exits without transcript queries.
         _ = get_access_token(debug=args.debug)
-        print(f"Authentication successful. Token cache: {TOKEN_CACHE_PATH}")
+        if _ACCESS_TOKEN_SOURCE == "oauth":
+            print(f"Authentication successful via OAuth. Token cache: {TOKEN_CACHE_PATH}")
+        elif _ACCESS_TOKEN_SOURCE == "env":
+            print("Authentication successful via WEBEX_ACCESS_TOKEN from environment.")
+        else:
+            print("Authentication successful.")
         return
 
     if args.meeting_id:
@@ -529,9 +710,23 @@ def main():
     if args.filter:
         query = args.filter.lower()
         meetings = [m for m in meetings if query in (m.get("title", "") or "").lower()]
+
+    if args.new_meetings:
+        seen_ids = load_seen_meeting_ids()
+        original_count = len(meetings)
+        meetings = [m for m in meetings if (m.get("id") or "") not in seen_ids]
+        debug_log(
+            args.debug,
+            f"new-meetings filter: {len(meetings)}/{original_count} unseen "
+            f"(cache: {SEEN_MEETINGS_CACHE_PATH})",
+        )
     
     if not meetings:
-        if args.filter:
+        if args.new_meetings and args.filter:
+            print(f'No new meetings found in this period matching filter "{args.filter}".')
+        elif args.new_meetings:
+            print("No new meetings found in this period.")
+        elif args.filter:
             print(f'No meetings found in this period matching filter "{args.filter}".')
         else:
             print("No meetings found in this period.")
@@ -606,6 +801,15 @@ def main():
                 print(f"Error writing CSV: {e}", file=sys.stderr)
         else:
             print("\nNo transcripts found to export.")
+
+    if args.new_meetings:
+        existing_seen_ids = load_seen_meeting_ids()
+        new_ids = {(m.get("id") or "") for m in meetings if m.get("id")}
+        if new_ids:
+            save_seen_meeting_ids(existing_seen_ids | new_ids)
+            print(
+                f"\nRecorded {len(new_ids)} meeting IDs in cache: {SEEN_MEETINGS_CACHE_PATH}"
+            )
 
 if __name__ == "__main__":
     main()

@@ -13,6 +13,14 @@ pip install -r requirements.txt
 
 Set authentication (choose one):
 
+You can start from the example file:
+
+```bash
+cp .env.example .env
+```
+
+The script auto-loads `.env` from the project root when it starts.
+
 Option 1: Personal access token (existing behavior)
 
 ```bash
@@ -46,4 +54,8 @@ python list-transcripts.py --days 7
 python list-transcripts.py --csv
 python list-transcripts.py --months 2 --csv
 python list-transcripts.py --login
+python list-transcripts.py --clear-auth
+python list-transcripts.py --new-meetings --meetings-only
 ```
+
+`--new-meetings` uses a local cache file at `~/.wbx_meeting_transcripts_seen_meetings.json` to track already-listed meeting IDs across runs.
